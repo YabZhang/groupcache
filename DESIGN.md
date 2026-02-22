@@ -14,7 +14,7 @@ The system consists of multiple peer processes (nodes) that form a distributed c
 
 ```mermaid
 graph TD
-    Client[Client Application] -->|Get Key| Node1[Node 1 (Local)]
+    Client[Client Application] -->|Get Key| Node1[Node 1 Local]
 
     subgraph Cluster [Groupcache Cluster]
         Node1
