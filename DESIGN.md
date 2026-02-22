@@ -14,7 +14,7 @@ The system consists of multiple peer processes (nodes) that form a distributed c
 
 ```mermaid
 graph TD
-    Client[Client Application] -->|Get Key| Node1[Node 1 （Local）]
+    Client[Client Application] -->|Get Key| Node1[Node 1 (Local)]
 
     subgraph Cluster [Groupcache Cluster]
         Node1
@@ -24,8 +24,8 @@ graph TD
     end
 
     Node1 -->|Pick Peer| CH{Consistent Hash}
-    CH -->|Hash （Key） -> Node 2| Node2
-    CH -->|Hash （Key） -> Node 1| DB[（Database/Source）]
+    CH -->|Hash(Key) -> Node 2| Node2
+    CH -->|Hash(Key) -> Node 1| DB[(Database/Source)]
 
     Node2 -->|Get| DB
     Node1 -.->|HTTP/Proto| Node2
@@ -90,7 +90,105 @@ classDiagram
     Group --> SingleFlight : dedups requests
 ```
 
-## 4. Data Flow: The `Get` Lifecycle
+## 4. Core Data Structures
+
+Understanding the internal data structures of key components reveals how `groupcache` achieves efficiency and thread safety.
+
+### Consistent Hash Map (`consistenthash/consistenthash.go`)
+
+This component maps input keys to one of the available peer nodes.
+
+```mermaid
+classDiagram
+    class Map {
+        Hash hash
+        int replicas
+        int[] keys
+        map~int, string~ hashMap
+        Add(keys...)
+        Get(key) string
+    }
+
+    note for Map "keys is a sorted list of all virtual node hashes.\nhashMap maps a virtual node hash to the real peer name."
+```
+
+*   **`keys []int`**: A sorted slice of hash values. Each peer is hashed `replicas` times (default 50) with different suffixes (e.g., "0node1", "1node1") to create "virtual nodes". This ensures even distribution.
+*   **`hashMap map[int]string`**: Maps the hash of a virtual node back to the actual peer name (e.g., `12345` -> "10.0.0.1:8080").
+*   **Lookup**: To find the peer for a given key, the key is hashed, and a **binary search** (`sort.Search`) is performed on `keys` to find the first virtual node hash `>=` the key's hash.
+
+### LRU Cache (`lru/lru.go`)
+
+A classic Least Recently Used cache implementation.
+
+```mermaid
+classDiagram
+    class Cache {
+        int MaxEntries
+        func OnEvicted
+        List ll
+        map~interface{}, *Element~ cache
+        Add(key, value)
+        Get(key)
+        RemoveOldest()
+    }
+
+    class List {
+        <<Doubly Linked List>>
+        Front() *Element
+        Back() *Element
+        PushFront(value)
+        MoveToFront(e)
+    }
+
+    class Element {
+        Value interface{}
+        Next()
+        Prev()
+    }
+
+    Cache *-- List : stores order
+    Cache *-- Element : map values point to list elements
+```
+
+*   **`ll *list.List`**: A doubly linked list. The most recently used item is at the front; the least recently used is at the back.
+*   **`cache map[interface{}]*list.Element`**: A map providing O(1) access to list elements by key.
+*   **Eviction**: When `MaxEntries` is reached, `RemoveOldest()` removes the element at the back of the list and deletes it from the map.
+
+### Singleflight Group (`singleflight/singleflight.go`)
+
+Ensures that only one execution of a function (e.g., a database load) happens at a time for a given key.
+
+```mermaid
+classDiagram
+    class Group {
+        Mutex mu
+        map~string, *call~ m
+        Do(key, fn) (interface{}, error)
+    }
+
+    class call {
+        WaitGroup wg
+        interface{} val
+        error err
+    }
+
+    Group "1" *-- "many" call : tracks in-flight requests
+```
+
+*   **`m map[string]*call`**: Tracks currently executing calls. If a key exists in this map, it means a request is already in progress.
+*   **`call`**: Represents a single execution.
+    *   **`wg sync.WaitGroup`**: Other callers `Wait()` on this if the call is already in progress.
+    *   **`val`, `err`**: Store the result once the function completes.
+*   **Flow**:
+    1.  Lock `mu`.
+    2.  Check if `key` is in `m`.
+    3.  If yes (duplicate), unlock `mu` and `Wait()` on the existing `call.wg`. Return its result.
+    4.  If no, create a new `call`, add to `m`, unlock `mu`.
+    5.  Execute `fn()`.
+    6.  Store result in `call`, call `wg.Done()`.
+    7.  Lock `mu`, delete `key` from `m`, unlock.
+
+## 5. Data Flow: The `Get` Lifecycle
 
 When a client requests a key via `Group.Get(key)`, the following sequence occurs:
 
@@ -146,7 +244,7 @@ sequenceDiagram
     end
 ```
 
-## 5. Key Concepts
+## 6. Key Concepts
 
 ### Consistent Hashing (`consistenthash/`)
 Maps keys to nodes (peers).
