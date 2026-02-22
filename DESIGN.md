@@ -14,7 +14,7 @@ The system consists of multiple peer processes (nodes) that form a distributed c
 
 ```mermaid
 graph TD
-    Client[Client Application] -->|Get Key| Node1[Node 1 （Local）]
+    Client[Client Application] -->|Get Key| Node1[Node 1 (Local)]
 
     subgraph Cluster [Groupcache Cluster]
         Node1
@@ -24,8 +24,8 @@ graph TD
     end
 
     Node1 -->|Pick Peer| CH{Consistent Hash}
-    CH -->|Hash（Key） -> Node 2| Node2
-    CH -->|Hash（Key） -> Node 1| DB[（Database/Source）]
+    CH -->|Hash(Key) -> Node 2| Node2
+    CH -->|Hash(Key) -> Node 1| DB[(Database/Source)]
 
     Node2 -->|Get| DB
     Node1 -.->|HTTP/Proto| Node2
@@ -271,3 +271,115 @@ Prevents "Thundering Herd".
 - Communication between peers uses Protocol Buffers (`groupcachepb/`) for efficiency.
 - `GetRequest` contains the group name and key.
 - `GetResponse` contains the value.
+
+## 7. Optimizations & Design Patterns
+
+`groupcache` contains several sophisticated design patterns that optimize performance and concurrency.
+
+### Immutable `ByteView` Pattern (`byteview.go`)
+
+To avoid expensive data copying while ensuring thread safety, `groupcache` uses an immutable view over the data.
+
+```mermaid
+classDiagram
+    class ByteView {
+        []byte b
+        string s
+        Len() int
+        ByteSlice() []byte
+        String() string
+        At(i) byte
+        Slice(from, to) ByteView
+        Reader() io.ReadSeeker
+    }
+
+    note for ByteView "Wraps either []byte or string.\nRead-only methods ensure immutability."
+```
+
+*   **Design**: `ByteView` holds either a `[]byte` or a `string`. It never exposes the underlying slice directly (methods like `ByteSlice()` return a copy).
+*   **Brilliance**: This immutability means the cache can return the same `ByteView` value to thousands of concurrent readers without needing locks or defensive copies.
+
+### The `Sink` Interface Strategy (`sinks.go`)
+
+The `Sink` interface decouples the *retrieval* of data from its *storage*, allowing for highly flexible implementations.
+
+```mermaid
+classDiagram
+    class Sink {
+        <<interface>>
+        SetString(s) error
+        SetBytes(v) error
+        SetProto(m) error
+    }
+
+    class StringSink {
+        sp *string
+    }
+
+    class ByteViewSink {
+        dst *ByteView
+    }
+
+    class ProtoSink {
+        dst proto.Message
+    }
+
+    class AllocatingByteSliceSink {
+        dst *[]byte
+    }
+
+    Sink <|-- StringSink
+    Sink <|-- ByteViewSink
+    Sink <|-- ProtoSink
+    Sink <|-- AllocatingByteSliceSink
+```
+
+*   **Design**: When calling `Get`, the caller provides a `Sink`. The library populates it.
+*   **Brilliance**:
+    *   **Zero-Copy Potential**: Internally, `groupcache` can optimize (e.g., `viewSetter` interface) to set the value directly without copying if the source is already a `ByteView`.
+    *   **Flexibility**: You can ask for a string, a raw byte slice, or a fully unmarshaled Protobuf object just by passing a different Sink.
+
+### Buffer Pooling with `sync.Pool` (`http.go`)
+
+In a high-throughput network system, allocating a new buffer for every incoming HTTP response creates massive Garbage Collection (GC) pressure.
+
+*   **Design**: `HTTPPool` uses a `sync.Pool` to reuse `bytes.Buffer` instances.
+*   **Brilliance**: Instead of allocating and deallocating memory for every request, buffers are retrieved from the pool, reset, used, and returned. This significantly reduces the workload on the Go runtime's garbage collector.
+
+### Lock-Free Statistics (`AtomicInt`)
+
+Counters like "Cache Hits" or "Total Loads" are updated frequently. Using a standard `sync.Mutex` would introduce significant contention and slow down the system.
+
+*   **Design**: `groupcache` uses `sync/atomic` wrappers (aliased as `AtomicInt`).
+*   **Brilliance**: Atomic hardware instructions (`LOCK XADD` on x86) are orders of magnitude faster than OS-level mutexes for simple counters, allowing accurate statistics without performance penalties.
+
+### Singleflight Double-Check Locking
+
+A subtle but critical optimization exists in `Group.load` to handle race conditions during cache filling.
+
+```mermaid
+sequenceDiagram
+    participant G as Group
+    participant SF as SingleFlight
+    participant C as Cache
+
+    G->>SF: Do(key, fn)
+
+    rect rgb(240, 240, 240)
+        note right of SF: Inside fn()
+        SF->>C: lookupCache(key) [Double Check]
+        alt Found in Cache
+            C-->>SF: Value (Return Early)
+        else Not Found
+            SF->>SF: Proceed to Load Data
+        end
+    end
+```
+
+*   **Design**: Even after entering the `singleflight` group (which ensures only one loader runs), the code checks the cache *again*.
+*   **Brilliance**:
+    1.  Request A misses cache. Starts loading.
+    2.  Request B misses cache. Gets stuck behind A in singleflight.
+    3.  Request A finishes, populates cache, returns.
+    4.  Request B (now unblocked) *could* mistakenly try to load again if logic was different.
+    5.  **However**, this pattern specifically handles cases where *concurrent* independent loads might have raced. More importantly, it prevents a "thundering herd" of singleflight executions if the cache was populated by a mechanism outside the singleflight group (e.g. a hot cache promotion).
