@@ -185,7 +185,22 @@ classDiagram
 
 ---
 
-## 6. 设计哲学与权衡 (Design Philosophy & Trade-offs)
+## 6. 深入剖析与架构权衡 (Deep Dive & Trade-offs)
+
+### 6.1 内存管理与零拷贝 (Memory Management & Zero-Copy)
+`groupcache` 非常注重运行时的性能和 GC（垃圾回收）压力，这主要体现在 `ByteView` 和 `Sink` 接口的设计上。
+*   **ByteView 的不可变性**：`ByteView` 结构体同时包含 `[]byte` 和 `string` 两个字段。由于 Go 中 `string` 与 `[]byte` 的互相转换会导致内存分配和拷贝，`ByteView` 在初始化时保存原始类型，并在读取时优先返回对应类型，避免了隐式拷贝。此外，作为值类型（Value Type）传递，而不是指针传递，它使得开发者无需引入读写锁（RWMutex）就可以安全地在多线程环境下共享数据。
+*   **Sink 接口抽象**：`Get` 方法并没有简单地返回 `[]byte`，而是要求传入一个 `Sink`。这类似于**访问者模式 (Visitor Pattern)**。如果你最终需要的是一个 Protobuf 对象，你可以传入 `ProtoSink`。`groupcache` 内部拿到字节流后，会直接将其 Unmarshal 到你的对象中，而不需要先返回一个 `[]byte` 切片，然后再由应用层进行反序列化，这样可以大幅减少堆内存的分配（Allocations）。
+
+### 6.2 热点缓存机制 (HotCache Population)
+一致性哈希的一个致命弱点是：如果某个 Key 极其热门（例如大促活动时的首页配置），那么这一个 Owner 节点会承受所有的流量，导致网卡或 CPU 被打满（即“热点问题”/ Hotspotting）。
+*   `groupcache` 引入了 `hotCache`。如果本节点不是该 Key 的 Owner，它去远端请求并成功拿到数据后，会有一个**随机概率（默认是 10%，见 `groupcache.go:getFromPeer` 中的 `rand.Intn(10) == 0`）**将该数据也放入自己的本地 `hotCache` 中。
+*   **数学逻辑**：为什么是概率？如果每次都存入，会导致所有节点都拥有一份全量拷贝，浪费大量内存；如果概率太低，起不到分担压力的作用。10% 的概率意味着，如果这个 Key 被请求了 1000 次，大约会有 100 次将数据留在各个客户端本地，后续这些客户端的请求就不会再打到 Owner 节点，从而完美地平滑了瞬时高并发流量。
+
+### 6.3 Protobuf 优化集成
+在 `http.go` 中，节点之间的 RPC 请求和响应也是使用了 Protobuf（见 `groupcachepb` 包）。除了序列化体积小、速度快之外，结合上面提到的 `Sink` 接口，如果应用层请求的也是 Protobuf 数据，`groupcache` 甚至可以直接对底层字节流做一次反序列化就直达业务逻辑。
+
+### 6.4 与外部缓存系统 (Redis/Memcached) 的对比权衡
 
 1.  **Immutability (不可变性)**
     *   **决策**：不支持 Key 的更新和删除。

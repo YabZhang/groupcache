@@ -26,6 +26,13 @@ import (
 //
 // Implementation of Getter must call exactly one of the Set methods
 // on success.
+// Sink 接口定义了从 groupcache 获取数据或者填充数据的方式。
+// 它的设计模式类似于 "Visitor Pattern"，目的是为了在不同的数据类型
+// (string, []byte, proto.Message) 和不同的内存分配策略之间提供一层抽象。
+//
+// 想象一下如果直接使用 `func Get(key string) ([]byte, error)`，
+// 那么如果用户实际需要的是字符串或者 Protobuf，就必须在使用前后进行转换和序列化。
+// 而如果传入一个 Sink，底层 `Getter` 在填充数据时，可以根据 Sink 的类型采用最高效的路径（如零拷贝）。
 type Sink interface {
 	// SetString sets the value to s.
 	SetString(s string) error
@@ -39,6 +46,7 @@ type Sink interface {
 	SetProto(m proto.Message) error
 
 	// view returns a frozen view of the bytes for caching.
+	// 这是一个仅在 groupcache 内部使用的方法，将得到的数据转化成不可变的 ByteView 存入缓存。
 	view() (ByteView, error)
 }
 
@@ -211,6 +219,7 @@ func (s *protoSink) SetProto(m proto.Message) error {
 // AllocatingByteSliceSink returns a Sink that allocates
 // a byte slice to hold the received value and assigns
 // it to *dst. The memory is not retained by groupcache.
+// 创建一个可以分配内存的 []byte 接收器。
 func AllocatingByteSliceSink(dst *[]byte) Sink {
 	return &allocBytesSink{dst: dst}
 }

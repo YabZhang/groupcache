@@ -334,6 +334,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 		Key:   &key,
 	}
 	res := &pb.GetResponse{}
+	// 通过 HTTP/Protobuf 调用远程节点的 Get
 	err := peer.Get(ctx, req, res)
 	if err != nil {
 		return ByteView{}, err
@@ -342,11 +343,16 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	// TODO(bradfitz): use res.MinuteQps or something smart to
 	// conditionally populate hotCache.  For now just do it some
 	// percentage of the time.
+	// 这里是解决分布式系统“热点”（Hotspot）问题的关键策略。
+	// 当一个非 Owner 节点去 Owner 节点请求数据时，如果每次请求都发网络，
+	// 那么极其热门的 Key 会把 Owner 节点的网卡打满。
+	// 为了平滑这种突发流量，groupcache 会以一定的概率（默认是 1/10）
+	// 将从远端拉取到的数据放入自己本地的 hotCache 中。
 	var pop bool
 	if g.rand != nil {
-		pop = g.rand.Intn(10) == 0
+		pop = g.rand.Intn(10) == 0 // 10% 的概率
 	} else {
-		pop = rand.Intn(10) == 0
+		pop = rand.Intn(10) == 0 // 10% 的概率
 	}
 	if pop {
 		g.populateCache(key, value, &g.hotCache)
@@ -373,21 +379,26 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 	cache.add(key, value)
 
 	// Evict items from cache(s) if necessary.
+	// 这是内存管理的核心：当 mainCache 和 hotCache 的总容量超过设定的阈值时，触发淘汰。
 	for {
 		mainBytes := g.mainCache.bytes()
 		hotBytes := g.hotCache.bytes()
 		if mainBytes+hotBytes <= g.cacheBytes {
-			return
+			return // 容量足够，安全退出
 		}
 
 		// TODO(bradfitz): this is good-enough-for-now logic.
 		// It should be something based on measurements and/or
 		// respecting the costs of different resources.
+		// 淘汰策略：优先淘汰 hotCache。
+		// 启发式算法：如果 hotCache 占用字节数大于 mainCache 的 1/8 (即总体容量的 1/9 左右)，
+		// 则从 hotCache 中淘汰数据；否则从 mainCache 中淘汰数据。
+		// 这样既能保证系统尽量拥有全局唯一副本（Main），又能给热点数据留有一点生存空间（Hot）。
 		victim := &g.mainCache
 		if hotBytes > mainBytes/8 {
 			victim = &g.hotCache
 		}
-		victim.removeOldest()
+		victim.removeOldest() // 调用 lru 的 RemoveOldest
 	}
 }
 
