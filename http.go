@@ -36,6 +36,8 @@ const defaultBasePath = "/_groupcache/"
 const defaultReplicas = 50
 
 // HTTPPool implements PeerPicker for a pool of HTTP peers.
+// HTTPPool 实现了 PeerPicker 接口，用于管理 HTTP 节点池。
+// 它既是一个客户端（分发请求），也是一个服务端（处理请求）。
 type HTTPPool struct {
 	// Context optionally specifies a context for the server to use when it
 	// receives a request.
@@ -54,8 +56,8 @@ type HTTPPool struct {
 	opts HTTPPoolOptions
 
 	mu          sync.Mutex // guards peers and httpGetters
-	peers       *consistenthash.Map
-	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+	peers       *consistenthash.Map // 一致性哈希映射
+	httpGetters map[string]*httpGetter // 每个远程节点对应的 HTTP 客户端
 }
 
 // HTTPPoolOptions are the configurations of a HTTPPool.
@@ -127,18 +129,24 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
+// PickPeer 根据 key 选择一个节点。
+// 如果选择的节点不是自己，则返回该节点的 getter 和 true。
 func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.peers.IsEmpty() {
 		return nil, false
 	}
+	// 通过一致性哈希找到 Owner
 	if peer := p.peers.Get(key); peer != p.self {
+		// 返回对应的 httpGetter
 		return p.httpGetters[peer], true
 	}
 	return nil, false
 }
 
+// ServeHTTP 处理来自其他节点的 HTTP 请求。
+// URL 格式: /_groupcache/<group_name>/<key>
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse request.
 	if !strings.HasPrefix(r.URL.Path, p.opts.BasePath) {
@@ -167,6 +175,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	group.Stats.ServerRequests.Add(1)
 	var value []byte
+	// 调用 group.Get 获取数据（可能是本地缓存，也可能是加载）
 	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -174,6 +183,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write the value to the response body as a proto message.
+	// 使用 Protobuf 编码响应
 	body, err := proto.Marshal(&pb.GetResponse{Value: value})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

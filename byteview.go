@@ -29,8 +29,18 @@ import (
 //
 // A ByteView is meant to be used as a value type, not
 // a pointer (like a time.Time).
+// ByteView 是一个只读的数据结构，用来表示缓存值。
+// 它内部可以包装 []byte 或者 string。
+// 选择它的目的是为了性能和内存安全：
+// 1. 它是不可变的 (immutable)，这意味着可以放心地在并发环境（缓存系统本身就是高并发的）
+//    下被多个 goroutine 共享，而不需要额外的读写锁来保护底层数据，也防止了外部使用者不小心修改缓存。
+// 2. 它设计为通过值传递（Value Type）而不是指针传递。
 type ByteView struct {
 	// If b is non-nil, b is used, else s is used.
+	// b 存储真实的字节数组。
+	// s 存储真实的字符串。
+	// 为什么要有两个字段？为了避免在不需要的时候在 string 和 []byte 之间进行昂贵的强制转换（涉及内存拷贝）。
+	// 在 Go 语言中，string 底层是只读的 []byte，直接互相转换会触发内存复制。
 	b []byte
 	s string
 }
@@ -44,14 +54,21 @@ func (v ByteView) Len() int {
 }
 
 // ByteSlice returns a copy of the data as a byte slice.
+// 返回底层的字节数组。
+// 注意：如果底层是 b，它一定会返回一份 **拷贝**。
+// 这是为了维护 ByteView 的不可变性。如果直接返回 v.b，外部调用者可能会修改里面的内容，
+// 从而破坏缓存的一致性。
 func (v ByteView) ByteSlice() []byte {
 	if v.b != nil {
 		return cloneBytes(v.b)
 	}
+	// 将 string 转换为 []byte 时，Go 编译器也会自动进行一次内存分配和拷贝。
 	return []byte(v.s)
 }
 
 // String returns the data as a string, making a copy if necessary.
+// 返回底层的字符串。
+// 与 ByteSlice 不同，这里不需要显式拷贝（除非底层是 []byte），因为 Go 的 string 本身就是不可变的。
 func (v ByteView) String() string {
 	if v.b != nil {
 		return string(v.b)

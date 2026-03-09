@@ -139,6 +139,8 @@ func callInitPeerServer() {
 
 // A Group is a cache namespace and associated data loaded spread over
 // a group of 1 or more machines.
+// Group 是 groupcache 的核心结构，代表一个缓存命名空间。
+// 它可以理解为整个分布式缓存集群的一个逻辑分组，比如 "users" 或 "files"。
 type Group struct {
 	name       string
 	getter     Getter
@@ -150,6 +152,8 @@ type Group struct {
 	// (amongst its peers) is authoritative. That is, this cache
 	// contains keys which consistent hash on to this process's
 	// peer number.
+	// mainCache 存储本节点作为 Owner 的 Key。
+	// 根据一致性哈希算法，这些 Key 映射到了当前节点。
 	mainCache cache
 
 	// hotCache contains keys/values for which this peer is not
@@ -160,11 +164,15 @@ type Group struct {
 	// network card could become the bottleneck on a popular key.
 	// This cache is used sparingly to maximize the total number
 	// of key/value pairs that can be stored globally.
+	// hotCache 存储本节点非 Owner，但访问频繁的热点 Key。
+	// 这样可以避免每次都去远程节点拉取，防止 Owner 节点因为过热而崩溃（Hot Spotting）。
 	hotCache cache
 
 	// loadGroup ensures that each key is only fetched once
 	// (either locally or remotely), regardless of the number of
 	// concurrent callers.
+	// loadGroup 使用 singleflight 机制，确保对于同一个 Key，同一时刻只有一个请求去加载数据。
+	// 这可以有效防止缓存击穿（Cache Stampede）。
 	loadGroup flightGroup
 
 	_ int32 // force Stats to be 8-byte aligned on 32-bit platforms
@@ -209,6 +217,12 @@ func (g *Group) initPeers() {
 	}
 }
 
+// Get 方法是 Group 的核心入口。
+// 流程：
+// 1. 初始化 PeerPicker（只做一次）。
+// 2. 检查本地缓存（MainCache 和 HotCache）。
+// 3. 如果命中，返回结果。
+// 4. 如果未命中，调用 load 方法加载数据。
 func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 	g.peersOnce.Do(g.initPeers)
 	g.Stats.Gets.Add(1)
@@ -238,6 +252,8 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 }
 
 // load loads key either by invoking the getter locally or by sending it to another machine.
+// load 方法负责在缓存未命中时获取数据。
+// 它使用 singleflight (loadGroup.Do) 来确保并发请求合并。
 func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
 	viewi, err := g.loadGroup.Do(key, func() (interface{}, error) {
@@ -262,6 +278,8 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		// 1: fn()
 		// 2: loadGroup.Do("key", fn)
 		// 2: fn()
+		// Double-Check Locking 模式：在进入 singleflight 后再次检查缓存。
+		// 因为可能有其他请求刚好在这个时间窗口内完成了加载并填充了缓存。
 		if value, cacheHit := g.lookupCache(key); cacheHit {
 			g.Stats.CacheHits.Add(1)
 			return value, nil
@@ -269,6 +287,8 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		g.Stats.LoadsDeduped.Add(1)
 		var value ByteView
 		var err error
+		// 1. 尝试从远程 Peer 获取。
+		// PickPeer 返回 true 说明 Owner 是远程节点。
 		if peer, ok := g.peers.PickPeer(key); ok {
 			value, err = g.getFromPeer(ctx, peer, key)
 			if err == nil {
@@ -281,6 +301,8 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 			// probably boring (normal task movement), so not
 			// worth logging I imagine.
 		}
+		// 2. 如果没有 Peer（单机模式），或者是 Peer 就是自己，或者远程获取失败，则回退到本地获取。
+		// getLocally 会调用用户注册的 Getter (例如查询数据库)。
 		value, err = g.getLocally(ctx, key, dest)
 		if err != nil {
 			g.Stats.LocalLoadErrs.Add(1)
@@ -288,6 +310,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		}
 		g.Stats.LocalLoads.Add(1)
 		destPopulated = true // only one caller of load gets this return value
+		// 本地获取成功后，将数据填充到 mainCache 中。
 		g.populateCache(key, value, &g.mainCache)
 		return value, nil
 	})
@@ -311,6 +334,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 		Key:   &key,
 	}
 	res := &pb.GetResponse{}
+	// 通过 HTTP/Protobuf 调用远程节点的 Get
 	err := peer.Get(ctx, req, res)
 	if err != nil {
 		return ByteView{}, err
@@ -319,11 +343,16 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	// TODO(bradfitz): use res.MinuteQps or something smart to
 	// conditionally populate hotCache.  For now just do it some
 	// percentage of the time.
+	// 这里是解决分布式系统“热点”（Hotspot）问题的关键策略。
+	// 当一个非 Owner 节点去 Owner 节点请求数据时，如果每次请求都发网络，
+	// 那么极其热门的 Key 会把 Owner 节点的网卡打满。
+	// 为了平滑这种突发流量，groupcache 会以一定的概率（默认是 1/10）
+	// 将从远端拉取到的数据放入自己本地的 hotCache 中。
 	var pop bool
 	if g.rand != nil {
-		pop = g.rand.Intn(10) == 0
+		pop = g.rand.Intn(10) == 0 // 10% 的概率
 	} else {
-		pop = rand.Intn(10) == 0
+		pop = rand.Intn(10) == 0 // 10% 的概率
 	}
 	if pop {
 		g.populateCache(key, value, &g.hotCache)
@@ -350,21 +379,26 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 	cache.add(key, value)
 
 	// Evict items from cache(s) if necessary.
+	// 这是内存管理的核心：当 mainCache 和 hotCache 的总容量超过设定的阈值时，触发淘汰。
 	for {
 		mainBytes := g.mainCache.bytes()
 		hotBytes := g.hotCache.bytes()
 		if mainBytes+hotBytes <= g.cacheBytes {
-			return
+			return // 容量足够，安全退出
 		}
 
 		// TODO(bradfitz): this is good-enough-for-now logic.
 		// It should be something based on measurements and/or
 		// respecting the costs of different resources.
+		// 淘汰策略：优先淘汰 hotCache。
+		// 启发式算法：如果 hotCache 占用字节数大于 mainCache 的 1/8 (即总体容量的 1/9 左右)，
+		// 则从 hotCache 中淘汰数据；否则从 mainCache 中淘汰数据。
+		// 这样既能保证系统尽量拥有全局唯一副本（Main），又能给热点数据留有一点生存空间（Hot）。
 		victim := &g.mainCache
 		if hotBytes > mainBytes/8 {
 			victim = &g.hotCache
 		}
-		victim.removeOldest()
+		victim.removeOldest() // 调用 lru 的 RemoveOldest
 	}
 }
 
